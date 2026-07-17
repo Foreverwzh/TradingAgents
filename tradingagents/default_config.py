@@ -131,11 +131,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # routed to vendors you didn't choose. For ordered fallback, list several,
     # e.g. "yfinance,alpha_vantage". "default" uses all available vendors.
     "data_vendors": {
-        # yfinance first (free, no key), alpha_vantage as fallback when yfinance
-        # rate-limits (needs ALPHA_VANTAGE_API_KEY; degrades to a logged
-        # "not configured" skip if the key is absent, same as before this chain
-        # was added).
-        "core_stock_apis": "yfinance,alpha_vantage",
+        # alpaca first for raw prices: same ALPACA_API_KEY/ALPACA_SECRET_KEY
+        # this monorepo already uses for live trading/VWAP data, with a far
+        # more generous free-tier limit than yfinance (frequent 429s in prod)
+        # or Alpha Vantage (25 req/day). US-listed equities only, so it falls
+        # through to yfinance for A-share/HK/forex/futures symbols it doesn't
+        # cover; alpha_vantage is the last resort when yfinance also rate-
+        # limits. Each vendor degrades to a logged "not configured" skip if
+        # its key is absent, not a hard failure.
+        "core_stock_apis": "alpaca,yfinance,alpha_vantage",
         "technical_indicators": "yfinance,alpha_vantage",
         "fundamental_data": "yfinance,alpha_vantage",
         "news_data": "yfinance,alpha_vantage",

@@ -1,5 +1,6 @@
 import logging
 
+from .alpaca_stock import get_stock as get_alpaca_stock
 from .alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -82,6 +83,7 @@ VENDOR_LIST = [
     "fred",
     "polymarket",
     "alpha_vantage",
+    "alpaca",
 ]
 
 # Optional enrichment categories. These add macro/event context to the news
@@ -97,6 +99,7 @@ VENDOR_METHODS = {
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
+        "alpaca": get_alpaca_stock,
     },
     # technical_indicators
     "get_indicators": {
