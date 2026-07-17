@@ -34,16 +34,12 @@ def _get_client():
     return StockHistoricalDataClient(key, secret)
 
 
-def get_stock(symbol: str, start_date: str, end_date: str) -> str:
-    """Returns raw daily OHLCV values filtered to the specified date range.
-
-    Args:
-        symbol: The name of the equity. For example: symbol=IBM
-        start_date: Start date in yyyy-mm-dd format
-        end_date: End date in yyyy-mm-dd format
-
-    Returns:
-        CSV string containing the daily time series data.
+def _fetch_bars_df(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Raw Alpaca daily bars as a DataFrame with Date/Open/High/Low/Close/Volume
+    columns (Date is tz-naive, not yet stringified). Shared by ``get_stock``
+    (the LLM-facing CSV tool) and ``stockstats_utils.load_ohlcv``'s
+    cross-vendor fallback -- callers needing a DataFrame use this directly
+    instead of parsing ``get_stock``'s formatted text back out.
     """
     from alpaca.common.exceptions import APIError
     from alpaca.data.enums import Adjustment, DataFeed
@@ -80,12 +76,27 @@ def get_stock(symbol: str, start_date: str, end_date: str) -> str:
         "timestamp": "Date", "open": "Open", "high": "High",
         "low": "Low", "close": "Close", "volume": "Volume",
     })
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     keep = [c for c in ("Date", "Open", "High", "Low", "Close", "Volume") if c in df.columns]
-    df = df[keep]
+    return df[keep]
+
+
+def get_stock(symbol: str, start_date: str, end_date: str) -> str:
+    """Returns raw daily OHLCV values filtered to the specified date range.
+
+    Args:
+        symbol: The name of the equity. For example: symbol=IBM
+        start_date: Start date in yyyy-mm-dd format
+        end_date: End date in yyyy-mm-dd format
+
+    Returns:
+        CSV string containing the daily time series data.
+    """
+    df = _fetch_bars_df(symbol, start_date, end_date)
     for col in ("Open", "High", "Low", "Close"):
         if col in df.columns:
             df[col] = df[col].round(2)
+    df = df.assign(Date=df["Date"].dt.strftime("%Y-%m-%d"))
 
     csv_string = df.to_csv(index=False)
     header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} (source: Alpaca)\n"

@@ -122,6 +122,22 @@ def _assert_ohlcv_not_stale(
         )
 
 
+def _try_alpaca_ohlcv(canonical: str, start_str: str, end_str: str) -> pd.DataFrame | None:
+    """Best-effort Alpaca fallback for load_ohlcv's direct (non-routed)
+    callers. Returns None on any failure -- not configured, non-US symbol,
+    rate-limited, no data -- so the caller falls back to its original
+    "no rows" behavior rather than propagating an Alpaca-specific error.
+    """
+    from .alpaca_stock import _fetch_bars_df
+
+    try:
+        df = _fetch_bars_df(canonical, start_str, end_str)
+    except Exception as e:
+        logger.warning("Alpaca fallback for %s OHLCV failed: %s", canonical, e)
+        return None
+    return df
+
+
 def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
@@ -172,8 +188,16 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             auto_adjust=True,
         ))
         downloaded = _ensure_date_column(downloaded.reset_index())
-        # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
+            # This path bypasses route_to_vendor's fallback chain entirely
+            # (load_ohlcv is called directly by the technical-indicators and
+            # verified-market-snapshot tools, not routed) -- try Alpaca before
+            # giving up, same as get_stock_data's vendor chain would. Any
+            # Alpaca failure (not configured, non-US symbol, rate-limited)
+            # is swallowed here so this degrades to the original behavior.
+            downloaded = _try_alpaca_ohlcv(canonical, start_str, end_str)
+        # Only cache real data — never persist an empty frame.
+        if downloaded is None or downloaded.empty or "Close" not in downloaded.columns:
             raise NoMarketDataError(
                 symbol, canonical, "Yahoo Finance returned no rows"
             )
