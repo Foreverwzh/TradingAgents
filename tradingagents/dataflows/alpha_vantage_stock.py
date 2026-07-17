@@ -9,8 +9,17 @@ def get_stock(
     end_date: str
 ) -> str:
     """
-    Returns raw daily OHLCV values, adjusted close values, and historical split/dividend events
-    filtered to the specified date range.
+    Returns raw daily OHLCV values filtered to the specified date range.
+
+    Uses TIME_SERIES_DAILY (unadjusted), not TIME_SERIES_DAILY_ADJUSTED: Alpha
+    Vantage moved the adjusted endpoint behind a paid plan, so on a free key
+    it deterministically fails with a "premium endpoint" error every single
+    call -- not a transient rate limit, a permanent wall regardless of quota.
+    That made this vendor's get_stock_data fallback pure dead weight (it
+    still burned a request against the free tier's 25/day budget before
+    failing). Unadjusted prices are a real, if imperfect, fallback -- no
+    split/dividend adjustment -- which beats no data at all when yfinance is
+    the one that's rate-limited.
 
     Args:
         symbol: The name of the equity. For example: symbol=IBM
@@ -18,7 +27,7 @@ def get_stock(
         end_date: End date in yyyy-mm-dd format
 
     Returns:
-        CSV string containing the daily adjusted time series data filtered to the date range.
+        CSV string containing the daily time series data filtered to the date range.
     """
     # Parse dates to determine the range
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -35,6 +44,6 @@ def get_stock(
         "datatype": "csv",
     }
 
-    response = _make_api_request("TIME_SERIES_DAILY_ADJUSTED", params)
+    response = _make_api_request("TIME_SERIES_DAILY", params)
 
     return _filter_csv_by_date_range(response, start_date, end_date)

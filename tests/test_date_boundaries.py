@@ -13,7 +13,11 @@ from tradingagents.dataflows.config import set_config
 
 
 @pytest.mark.unit
-def test_get_yfin_requests_inclusive_end(monkeypatch):
+def test_get_yfin_requests_inclusive_end(monkeypatch, tmp_path):
+    # get_YFin_data_online caches per exact (symbol, start_date, end_date) now
+    # -- isolate the cache dir so a cache hit from another test using the same
+    # params doesn't skip the fake fetch below.
+    set_config({"data_cache_dir": str(tmp_path)})
     captured = {}
 
     class FakeTicker:
