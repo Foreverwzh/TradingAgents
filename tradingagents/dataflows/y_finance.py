@@ -28,8 +28,19 @@ from .utils import safe_ticker_component
 # hit yfinance fresh every single time.
 _FIN_CACHE_TTL_SECONDS = 20 * 60 * 60  # ~1 trading day
 
+# get_YFin_data_online's start_date/end_date are picked by the LLM tool-caller
+# with no look_back_days limit anywhere in the pipeline (market analyst gives
+# no guidance on span; a 200 SMA alone needs ~200 trading days of history) and
+# can be re-invoked several times per run. A fixed lookback window would risk
+# silently truncating whatever range the model asked for, so this is cached
+# per exact (symbol, start_date, end_date) instead of a windowed range — safe
+# because the underlying data for a fully-past range never changes. TTL is
+# short (not the ~1-day fundamentals TTL) because a range whose end_date is
+# today includes a still-forming intraday bar.
+_OHLCV_ONLINE_CACHE_TTL_SECONDS = 4 * 60 * 60
 
-def _cached_df(cache_name: str, canonical: str, fetch_fn):
+
+def _cached_df(cache_name: str, canonical: str, fetch_fn, ttl_seconds: int = _FIN_CACHE_TTL_SECONDS):
     """Cache a raw (pre-date-filter) yfinance DataFrame to disk, keyed by
     symbol + statement type. Filtering by curr_date happens on the caller's
     side after this returns, same split as OHLCV's ``load_ohlcv`` — so the
@@ -40,7 +51,7 @@ def _cached_df(cache_name: str, canonical: str, fetch_fn):
     os.makedirs(config["data_cache_dir"], exist_ok=True)
     cache_file = os.path.join(config["data_cache_dir"], f"{safe_symbol}-{cache_name}.csv")
 
-    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < _FIN_CACHE_TTL_SECONDS:
+    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < ttl_seconds:
         cached = pd.read_csv(cache_file, index_col=0)
         if not cached.empty:
             return cached
@@ -88,7 +99,19 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_inclusive))
+
+    def _fetch():
+        raw = yf_retry(lambda: ticker.history(start=start_date, end=end_inclusive))
+        # Strip tz before caching so a cache-hit round trip (plain string
+        # index) and a fresh fetch (tz-aware DatetimeIndex) look the same.
+        if isinstance(raw.index, pd.DatetimeIndex) and raw.index.tz is not None:
+            raw.index = raw.index.tz_localize(None)
+        return raw
+
+    data = _cached_df(
+        f"ohlcv-online-{start_date}_{end_date}", canonical, _fetch,
+        ttl_seconds=_OHLCV_ONLINE_CACHE_TTL_SECONDS,
+    )
 
     # Empty result means the symbol is unknown/delisted. Raise a typed error
     # instead of returning prose: the routing layer turns it into a single
@@ -97,10 +120,6 @@ def get_YFin_data_online(
         raise NoMarketDataError(
             symbol, canonical, f"no rows between {start_date} and {end_date}"
         )
-
-    # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
 
     # Reject a stale frame (e.g. a year-old partial response) before it is
     # formatted into the report. Raises NoMarketDataError, which the router
