@@ -1,3 +1,6 @@
+import json
+import os
+import time
 from datetime import datetime
 from typing import Annotated
 
@@ -5,6 +8,7 @@ import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
+from .config import get_config
 from .stockstats_utils import (
     StockstatsUtils,
     _assert_ohlcv_not_stale,
@@ -13,6 +17,58 @@ from .stockstats_utils import (
     yf_retry,
 )
 from .symbol_utils import NoMarketDataError, normalize_symbol
+from .utils import safe_ticker_component
+
+# Fundamentals/financial-statement calls don't carry the look-ahead-bias risk
+# OHLCV does (they're not walked day-by-day in a backtest loop here), so a
+# same-day disk cache is safe: quarterly/annual statements don't change
+# intraday, and re-analyzing the same ticker same-day is common. This is the
+# single biggest lever against YFRateLimitError — each get_fundamentals/
+# balance_sheet/cashflow/income_statement/insider_transactions call used to
+# hit yfinance fresh every single time.
+_FIN_CACHE_TTL_SECONDS = 20 * 60 * 60  # ~1 trading day
+
+
+def _cached_df(cache_name: str, canonical: str, fetch_fn):
+    """Cache a raw (pre-date-filter) yfinance DataFrame to disk, keyed by
+    symbol + statement type. Filtering by curr_date happens on the caller's
+    side after this returns, same split as OHLCV's ``load_ohlcv`` — so the
+    cache stays valid across calls with different curr_date/trade_date.
+    """
+    config = get_config()
+    safe_symbol = safe_ticker_component(canonical)
+    os.makedirs(config["data_cache_dir"], exist_ok=True)
+    cache_file = os.path.join(config["data_cache_dir"], f"{safe_symbol}-{cache_name}.csv")
+
+    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < _FIN_CACHE_TTL_SECONDS:
+        cached = pd.read_csv(cache_file, index_col=0)
+        if not cached.empty:
+            return cached
+
+    data = fetch_fn()
+    if data is not None and not data.empty:
+        data.to_csv(cache_file)
+    return data
+
+
+def _cached_info(canonical: str, fetch_fn) -> dict:
+    """Cache yfinance's ``Ticker.info`` dict (used by get_fundamentals) to disk."""
+    config = get_config()
+    safe_symbol = safe_ticker_component(canonical)
+    os.makedirs(config["data_cache_dir"], exist_ok=True)
+    cache_file = os.path.join(config["data_cache_dir"], f"{safe_symbol}-info.json")
+
+    if os.path.exists(cache_file) and (time.time() - os.path.getmtime(cache_file)) < _FIN_CACHE_TTL_SECONDS:
+        with open(cache_file, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached:
+            return cached
+
+    info = fetch_fn()
+    if info:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+    return info
 
 
 def get_YFin_data_online(
@@ -279,7 +335,7 @@ def get_fundamentals(
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
-        info = yf_retry(lambda: ticker_obj.info)
+        info = _cached_info(canonical, lambda: yf_retry(lambda: ticker_obj.info))
 
         if not info:
             raise NoMarketDataError(ticker, canonical, "no fundamentals returned")
@@ -349,9 +405,13 @@ def get_balance_sheet(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
+            data = _cached_df(
+                "balance-sheet-quarterly", canonical, lambda: yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.balance_sheet)
+            data = _cached_df(
+                "balance-sheet-annual", canonical, lambda: yf_retry(lambda: ticker_obj.balance_sheet)
+            )
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -384,9 +444,11 @@ def get_cashflow(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
+            data = _cached_df(
+                "cashflow-quarterly", canonical, lambda: yf_retry(lambda: ticker_obj.quarterly_cashflow)
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.cashflow)
+            data = _cached_df("cashflow-annual", canonical, lambda: yf_retry(lambda: ticker_obj.cashflow))
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -419,9 +481,11 @@ def get_income_statement(
         ticker_obj = yf.Ticker(canonical)
 
         if freq.lower() == "quarterly":
-            data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
+            data = _cached_df(
+                "income-stmt-quarterly", canonical, lambda: yf_retry(lambda: ticker_obj.quarterly_income_stmt)
+            )
         else:
-            data = yf_retry(lambda: ticker_obj.income_stmt)
+            data = _cached_df("income-stmt-annual", canonical, lambda: yf_retry(lambda: ticker_obj.income_stmt))
 
         data = filter_financials_by_date(data, curr_date)
 
@@ -450,7 +514,9 @@ def get_insider_transactions(
     canonical = normalize_symbol(ticker)
     try:
         ticker_obj = yf.Ticker(canonical)
-        data = yf_retry(lambda: ticker_obj.insider_transactions)
+        data = _cached_df(
+            "insider-transactions", canonical, lambda: yf_retry(lambda: ticker_obj.insider_transactions)
+        )
 
         # Empty is normal here (many valid symbols have no insider filings),
         # so report it plainly rather than treating the symbol as invalid.

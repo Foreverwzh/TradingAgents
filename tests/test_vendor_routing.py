@@ -118,6 +118,23 @@ class VendorRoutingTests(unittest.TestCase):
                 self.assertRaises(ValueError):
             interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
 
+    def test_all_vendors_erroring_names_every_one_not_just_the_first(self):
+        # Regression: a single "first_error" used to hide later vendors'
+        # failures — e.g. yfinance rate-limited, alpha_vantage *also*
+        # rate-limited, but the raised message only ever named yfinance,
+        # making it look like the fallback never even ran.
+        set_config({"data_vendors": {"core_stock_apis": "yfinance,alpha_vantage"}})
+        with self._route({
+            "yfinance": _raises(ValueError("yf boom")),
+            "alpha_vantage": _raises(ValueError("av boom")),
+        }), self.assertRaises(RuntimeError) as ctx:
+            interface.route_to_vendor("get_stock_data", "AAPL", "2026-01-01", "2026-01-10")
+        msg = str(ctx.exception)
+        self.assertIn("yfinance", msg)
+        self.assertIn("yf boom", msg)
+        self.assertIn("alpha_vantage", msg)
+        self.assertIn("av boom", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

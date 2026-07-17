@@ -193,20 +193,24 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_chain = all_available_vendors
 
     last_no_data: NoMarketDataError | None = None
-    first_error: Exception | None = None
+    # Every vendor's real error, in chain order — not just the first. A single
+    # "first_error" used to hide later vendors' failures: yfinance rate-limited,
+    # then alpha_vantage *also* rate-limited, but the surfaced message only ever
+    # said "YFRateLimitError", making it look like the fallback never ran.
+    vendor_errors: list[tuple[str, Exception]] = []
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
             return impl_func(*args, **kwargs)
-        except VendorRateLimitError:
+        except VendorRateLimitError as e:
             logger.warning("Vendor %r rate-limited for %s; trying next vendor.", vendor, method)
+            vendor_errors.append((vendor, e))
             continue
         except VendorNotConfiguredError as e:
             logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
-            if first_error is None:
-                first_error = e  # Surface it if no other vendor can serve the call.
+            vendor_errors.append((vendor, e))
             continue
         except NoMarketDataError as e:
             last_no_data = e  # No data here; another configured vendor may have it
@@ -216,21 +220,23 @@ def route_to_vendor(method: str, *args, **kwargs):
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
             logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
-            if first_error is None:
-                first_error = e
+            vendor_errors.append((vendor, e))
             continue
+
+    def _errors_summary() -> str:
+        return "; ".join(f"{v}: {type(e).__name__}: {e}" for v, e in vendor_errors)
 
     # If any vendor reported "no data", the symbol is genuinely unavailable.
     # Return one explicit, instructive sentinel rather than a vendor-specific
     # empty string, so the agent reports "unavailable" instead of inventing a
     # value. This takes precedence over incidental fallback errors.
     if last_no_data is not None:
-        if first_error is not None:
+        if vendor_errors:
             # A vendor also hit a real error; surface it in logs so the no-data
             # verdict can't hide a broken primary (network/auth/etc.).
             logger.warning(
-                "Returning NO_DATA for %s, but a vendor errored earlier: %s",
-                method, first_error,
+                "Returning NO_DATA for %s, but %d vendor(s) errored earlier: %s",
+                method, len(vendor_errors), _errors_summary(),
             )
         sym = last_no_data.symbol
         canonical = last_no_data.canonical
@@ -247,16 +253,27 @@ def route_to_vendor(method: str, *args, **kwargs):
         )
 
     # No vendor returned data and none reported clean "no data" — surface the
-    # first real error (e.g. the primary vendor's network failure). Optional
+    # real error(s) (e.g. every vendor in the chain rate-limited). Optional
     # enrichment categories degrade to a sentinel instead, so flavour data can't
     # abort the run.
-    if first_error is not None:
+    if vendor_errors:
         if category in OPTIONAL_CATEGORIES:
-            logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
+            summary = _errors_summary()
+            logger.warning("Optional %s unavailable for %s: %s", category, method, summary)
             return (
                 f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
-                f"({first_error}). Proceed without it; do not fabricate values."
+                f"({summary}). Proceed without it; do not fabricate values."
             )
-        raise first_error
+        if len(vendor_errors) == 1:
+            # Exactly one vendor was ever tried (or only one ever errored) —
+            # re-raise it verbatim so callers matching on its concrete type
+            # (e.g. a sole misconfigured vendor) keep working unchanged.
+            raise vendor_errors[0][1]
+        # Multiple vendors in the chain all failed with real errors: raise a
+        # single exception whose message names every vendor and its error,
+        # chained to the first failure for a full traceback.
+        raise RuntimeError(
+            f"All configured vendors failed for '{method}': {_errors_summary()}"
+        ) from vendor_errors[0][1]
 
     raise RuntimeError(f"No available vendor for '{method}'")
